@@ -642,18 +642,9 @@ impl Application for ImageConverter {
             ].spacing(10).align_items(iced::Alignment::Center)
         ].spacing(5);
 
-        // Quality. PNG is lossless, so the slider picks compression speed versus file size.
-        let quality_label = if self.target_format == TargetFormat::Png {
-            if self.quality >= 100.0 {
-                format!("Output Quality: {:.0} (smaller)", self.quality)
-            } else {
-                format!("Output Quality: {:.0} (fast)", self.quality)
-            }
-        } else {
-            format!("Output Quality: {:.0}", self.quality)
-        };
+        // Quality
         let quality_section = column![
-            text(quality_label).size(14),
+            text(format!("Output Quality: {:.0}", self.quality)).size(14),
             slider(1.0..=100.0, self.quality, Message::UpdateQuality)
         ].spacing(5);
 
