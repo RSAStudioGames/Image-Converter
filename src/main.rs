@@ -10,6 +10,7 @@ use iced::{
 use iced::widget::container::StyleSheet;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use walkdir::WalkDir;
 
 const ROW_HEIGHT: f32 = 32.0;
@@ -516,21 +517,26 @@ impl Application for ImageConverter {
                 let keep_animation = self.keep_animation;
                 let _remove_metadata = self.remove_metadata; // Used in logic logic implicitly by image crate behavior
 
-                // Perform conversion on a thread
-                Command::perform(async move {
-                    process_images(
-                        files,
-                        output_dir,
-                        target_format,
-                        quality,
-                        resize_option,
-                        append_suffix,
-                        suffix_text,
-                        move_to_trash,
-                        keep_transparency,
-                        keep_animation,
-                    ).await
-                }, Message::ConversionFinished)
+                // Each file runs on the blocking pool. The command future only
+                // waits, so the GUI worker stays free to draw.
+                Command::perform(
+                    async move {
+                        process_images(
+                            files,
+                            output_dir,
+                            target_format,
+                            quality,
+                            resize_option,
+                            append_suffix,
+                            suffix_text,
+                            move_to_trash,
+                            keep_transparency,
+                            keep_animation,
+                        )
+                        .await
+                    },
+                    Message::ConversionFinished,
+                )
             }
             Message::ConversionFinished(msg) => {
                 self.is_converting = false;
@@ -562,7 +568,7 @@ impl Application for ImageConverter {
         })
     }
 
-    fn view(&self) -> Element<Message> {
+    fn view(&self) -> Element<'_, Message> {
         // --- 3.2 File Management (Left) ---
         let (start, end) = self.visible_range();
         let top_gap = start as f32 * ROW_HEIGHT;
@@ -841,6 +847,51 @@ fn is_image(path: &Path) -> bool {
     }
 }
 
+/// How many photos to decode at once.
+/// A 24-megapixel RGBA buffer is about 96 MB, so more than four in flight
+/// can push the process into swap. Stay at or under the CPU count as well.
+fn batch_concurrency() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    batch_limit_for(cpus)
+}
+
+fn batch_limit_for(cpus: usize) -> usize {
+    cpus.clamp(1, 4)
+}
+
+/// Pick a free output path and record it so later files in this batch cannot
+/// claim the same name. Workers must not do this themselves: two of them can
+/// both see a path as free and overwrite each other.
+fn reserve_output_path(
+    path: &Path,
+    output_dir: &Option<PathBuf>,
+    target_format: TargetFormat,
+    append_suffix: bool,
+    suffix_text: &str,
+    reserved: &mut HashSet<PathBuf>,
+) -> Result<PathBuf, &'static str> {
+    let parent = output_dir
+        .as_deref()
+        .or_else(|| path.parent())
+        .ok_or("Invalid path")?;
+    let stem = path.file_stem().ok_or("No filename")?.to_string_lossy();
+    let suffix = if append_suffix { suffix_text } else { "" };
+    let extension = target_format.extension();
+
+    let mut base_name = format!("{stem}{suffix}.{extension}");
+    let mut output_path = parent.join(&base_name);
+    let mut counter = 1;
+    while output_path.exists() || reserved.contains(&output_path) {
+        base_name = format!("{stem}{suffix}({counter}).{extension}");
+        output_path = parent.join(&base_name);
+        counter += 1;
+    }
+    reserved.insert(output_path.clone());
+    Ok(output_path)
+}
+
 async fn process_images(
     files: Vec<PathBuf>,
     output_dir: Option<PathBuf>,
@@ -854,69 +905,87 @@ async fn process_images(
     keep_animation: bool,
 ) -> String {
     let mut errors = Vec::new();
-    let mut success_count = 0;
+    let mut reserved = HashSet::new();
+    let mut jobs = Vec::with_capacity(files.len());
 
     for path in files {
-        match convert_single_file(
+        match reserve_output_path(
             &path,
             &output_dir,
             target_format,
-            quality,
-            resize_option,
             append_suffix,
             &suffix_text,
-            keep_transparency,
-            keep_animation,
+            &mut reserved,
         ) {
-            Ok(_) => {
-                success_count += 1;
-                if move_to_trash {
-                    let _ = trash::delete(&path);
+            Ok(output_path) => jobs.push((path, output_path)),
+            Err(e) => errors.push(format!("{}: {e}", path.display())),
+        }
+    }
+
+    let limit = batch_concurrency();
+    let sem = Arc::new(tokio::sync::Semaphore::new(limit));
+    let mut set = tokio::task::JoinSet::new();
+
+    for (path, output_path) in jobs {
+        let sem = Arc::clone(&sem);
+        let label = path.display().to_string();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await.map_err(|_| {
+                format!("{label}: conversion pool closed")
+            })?;
+            tokio::task::spawn_blocking(move || {
+                match convert_single_file(
+                    &path,
+                    &output_path,
+                    target_format,
+                    quality,
+                    resize_option,
+                    keep_transparency,
+                    keep_animation,
+                ) {
+                    Ok(()) => {
+                        if move_to_trash {
+                            let _ = trash::delete(&path);
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("{}: {e}", path.display())),
                 }
-            }
-            Err(e) => {
-                errors.push(format!("{}: {}", path.display(), e));
-            }
+            })
+            .await
+            .unwrap_or_else(|err| Err(format!("{label}: {err}")))
+        });
+    }
+
+    let mut success_count = 0;
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(())) => success_count += 1,
+            Ok(Err(msg)) => errors.push(msg),
+            Err(err) => errors.push(format!("conversion task failed: {err}")),
         }
     }
 
     if errors.is_empty() {
         "Conversion complete".to_string()
     } else {
-        format!("Conversion complete with errors. Success: {}. Failed: {}", success_count, errors.len())
+        format!(
+            "Conversion complete with errors. Success: {success_count}. Failed: {}",
+            errors.len()
+        )
     }
 }
 
 fn convert_single_file(
     path: &Path,
-    output_dir: &Option<PathBuf>,
+    output_path: &Path,
     target_format: TargetFormat,
     quality: f64,
     resize_option: ResizeOption,
-    append_suffix: bool,
-    suffix_text: &str,
     keep_transparency: bool,
-    keep_animation: bool,
+    _keep_animation: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Determine Output Path
-    let parent = output_dir.as_deref().or_else(|| path.parent()).ok_or("Invalid path")?;
-    let stem = path.file_stem().ok_or("No filename")?.to_string_lossy();
-    
-    let suffix = if append_suffix { suffix_text } else { "" };
-    let extension = target_format.extension();
-    
-    let mut base_name = format!("{}{}.{}", stem, suffix, extension);
-    let mut output_path = parent.join(&base_name);
-
-    // Collision handling
-    let mut counter = 1;
-    while output_path.exists() {
-        base_name = format!("{}{}({}).{}", stem, suffix, counter, extension);
-        output_path = parent.join(&base_name);
-        counter += 1;
-    }
-
-    // 2. Load and resize.
+    // The output path was reserved before this worker started.
     // Shrinks use Catmull-Rom. Enlarges use Lanczos3 through fast_image_resize.
     // A JPEG at 1/2 or smaller is scaled in libjpeg-turbo during decode.
     let scale = resize_option.get_scale_factor();
@@ -930,8 +999,8 @@ fn convert_single_file(
     let should_flatten = !keep_transparency || !supports_transparency;
 
     let final_img = if should_flatten && img.color().has_alpha() {
-        // Convert to RGB by flattening against a white background
-        image::DynamicImage::ImageRgb8(img.to_rgb8())
+        // Drop alpha. into_rgb8 does not composite onto white.
+        image::DynamicImage::ImageRgb8(img.into_rgb8())
     } else {
         img
     };
@@ -956,46 +1025,58 @@ fn convert_single_file(
 
     match target_format {
         TargetFormat::Jpg => {
-            encode_jpeg(&final_img, quality, &mut writer)?;
+            encode_jpeg(final_img, quality, &mut writer)?;
         },
         TargetFormat::Png => {
-             let compression = if quality >= 100.0 {
-                 image::codecs::png::CompressionType::Default
-             } else {
-                 image::codecs::png::CompressionType::Fast
-             };
-             let encoder = image::codecs::png::PngEncoder::new_with_quality(
-                 &mut writer,
-                 compression,
-                 image::codecs::png::FilterType::Adaptive,
-             );
+             // Fast is the default. The quality slider is not a PNG compression control.
+             let encoder = image::codecs::png::PngEncoder::new(&mut writer);
              final_img.write_with_encoder(encoder)?;
         },
         TargetFormat::Gif => {
-             // If we really wanted animation, we'd use GifEncoder with frames here.
-             // For now, saving the static processed image.
+             // Opaque frames stay RGB. encode() quantizes with from_rgb_speed at
+             // this encoder's speed (1) and sets disposal to Background.
              let mut encoder = image::codecs::gif::GifEncoder::new(&mut writer);
-             encoder.encode_frame(image::Frame::new(final_img.to_rgba8()))?;
+             if final_img.color().has_alpha() {
+                 encoder.encode_frame(image::Frame::new(final_img.into_rgba8()))?;
+             } else {
+                 let rgb = final_img.into_rgb8();
+                 encoder.encode(
+                     rgb.as_raw(),
+                     rgb.width(),
+                     rgb.height(),
+                     image::ExtendedColorType::Rgb8,
+                 )?;
+             }
         },
         TargetFormat::WebP => {
-            // Use webp crate for both lossless and lossy WebP encoding to properly support quality settings
             use std::io::Write;
+            use webp::{Encoder, PixelLayout};
 
-            // Convert the image to RGBA for WebP encoding
-            let rgba_image = final_img.to_rgba8();
-            let width = rgba_image.width();
-            let height = rgba_image.height();
+            let encode = |encoder: Encoder<'_>| -> Vec<u8> {
+                if quality >= 100.0 {
+                    encoder.encode_lossless().to_vec()
+                } else {
+                    encoder.encode(quality as f32).to_vec()
+                }
+            };
 
-            let webp_data = if quality >= 100.0 {
-                // Lossless encoding
-                use webp::Encoder;
-                let encoder = Encoder::new(rgba_image.as_raw(), webp::PixelLayout::Rgba, width, height);
-                encoder.encode_lossless().to_vec()
+            // Opaque images stay 3 bytes per pixel. into_* moves an existing buffer.
+            let webp_data = if final_img.color().has_alpha() {
+                let rgba = final_img.into_rgba8();
+                encode(Encoder::new(
+                    rgba.as_raw(),
+                    PixelLayout::Rgba,
+                    rgba.width(),
+                    rgba.height(),
+                ))
             } else {
-                // Lossy encoding with specified quality
-                use webp::Encoder;
-                let encoder = Encoder::new(rgba_image.as_raw(), webp::PixelLayout::Rgba, width, height);
-                encoder.encode(quality as f32).to_vec()
+                let rgb = final_img.into_rgb8();
+                encode(Encoder::new(
+                    rgb.as_raw(),
+                    PixelLayout::Rgb,
+                    rgb.width(),
+                    rgb.height(),
+                ))
             };
 
             writer.write_all(&webp_data)?;
@@ -1010,13 +1091,14 @@ fn convert_single_file(
 }
 
 fn encode_jpeg<W: std::io::Write>(
-    img: &image::DynamicImage,
+    img: image::DynamicImage,
     quality: f64,
     writer: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let quality = quality.clamp(1.0, 100.0).round() as i32;
     // Quality 100 stays lossy. Grayscale stays one channel; color uses 4:2:0.
-    let encoded = if let Some(gray) = img.as_luma8() {
+    // into_rgb8 reuses the buffer when the image is already RGB8.
+    let encoded = if let image::DynamicImage::ImageLuma8(gray) = img {
         turbojpeg::compress(
             turbojpeg::Image {
                 pixels: gray.as_raw().as_slice(),
@@ -1029,7 +1111,7 @@ fn encode_jpeg<W: std::io::Write>(
             turbojpeg::Subsamp::Gray,
         )?
     } else {
-        let rgb = img.to_rgb8();
+        let rgb = img.into_rgb8();
         turbojpeg::compress(
             turbojpeg::Image {
                 pixels: rgb.as_raw().as_slice(),
@@ -1043,6 +1125,27 @@ fn encode_jpeg<W: std::io::Write>(
         )?
     };
     writer.write_all(&encoded)?;
+    Ok(())
+}
+
+const MAX_IMAGE_DIM: u32 = 32_768;
+const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
+
+fn reject_oversized_dimensions(width: u32, height: u32) -> Result<(), Box<dyn std::error::Error>> {
+    if width > MAX_IMAGE_DIM || height > MAX_IMAGE_DIM {
+        return Err(format!(
+            "image is {width}x{height}, over the {MAX_IMAGE_DIM} pixel limit"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn reject_oversized_buffer(bytes: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    if bytes > MAX_DECODED_BYTES {
+        return Err("decoded image exceeds the 512 MiB allocation limit".into());
+    }
     Ok(())
 }
 
@@ -1095,10 +1198,21 @@ fn load_scaled_image(
         }
     }
     if (scale - 1.0).abs() <= f64::EPSILON {
-        return Ok(image::open(path)?);
+        return Ok(open_with_limits(path)?);
     }
-    let img = image::open(path)?;
+    let img = open_with_limits(path)?;
     resize_to_scale(img, scale)
+}
+
+/// Strict width and height, plus the crate's default 512 MiB allocation cap.
+/// `Limits` is non-exhaustive, so this starts from `Default` and only sets dimensions.
+fn open_with_limits(path: &Path) -> image::ImageResult<image::DynamicImage> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIM);
+    limits.max_image_height = Some(MAX_IMAGE_DIM);
+    let mut reader = image::ImageReader::open(path)?;
+    reader.limits(limits);
+    reader.decode()
 }
 
 fn resize_to_scale(
@@ -1113,6 +1227,9 @@ fn decode_jpeg(path: &Path) -> Result<image::DynamicImage, Box<dyn std::error::E
     let jpeg_data = std::fs::read(path)?;
     let mut decompressor = turbojpeg::Decompressor::new()?;
     let header = decompressor.read_header(&jpeg_data)?;
+    let full_width = u32::try_from(header.width)?;
+    let full_height = u32::try_from(header.height)?;
+    reject_oversized_dimensions(full_width, full_height)?;
     let format = jpeg_pixel_format(header.colorspace)?;
     decompress_jpeg(&mut decompressor, &jpeg_data, header.width, header.height, format)
 }
@@ -1130,6 +1247,7 @@ fn decode_jpeg_scaled(
     let factor = jpeg_dct_factor(scale).ok_or("JPEG scale is larger than 1/2")?;
     let full_width = u32::try_from(header.width)?;
     let full_height = u32::try_from(header.height)?;
+    reject_oversized_dimensions(full_width, full_height)?;
     let (target_width, target_height) = target_size(full_width, full_height, scale);
 
     decompressor.set_scaling_factor(factor)?;
@@ -1187,6 +1305,7 @@ fn decompress_jpeg(
     };
     let pitch = width.checked_mul(channels).ok_or("JPEG pitch overflow")?;
     let buf_len = pitch.checked_mul(height).ok_or("JPEG buffer overflow")?;
+    reject_oversized_buffer(buf_len)?;
     let mut pixels = vec![0u8; buf_len];
     let output = turbojpeg::Image {
         pixels: pixels.as_mut_slice(),
@@ -1308,7 +1427,7 @@ fn resize_dynamic(
             )?)
         }
         other => {
-            let rgba = other.to_rgba8();
+            let rgba = other.into_rgba8();
             image::DynamicImage::ImageRgba8(resize_u8_image(
                 rgba,
                 dst_width,
@@ -1510,5 +1629,108 @@ mod tests {
         let odd_out = resize_to_scale(odd, 0.5).unwrap();
         assert_eq!((odd_out.width(), odd_out.height()), (50, 40));
         assert!(matches!(odd_out, image::DynamicImage::ImageRgb8(_)));
+    }
+
+    #[test]
+    fn oversized_png_header_is_rejected() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "image-converter-oversized-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, png_with_dimensions(super::MAX_IMAGE_DIM + 1, 1)).unwrap();
+        let error = super::open_with_limits(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(error, image::ImageError::Limits(_)),
+            "expected a decode limit error, got {error}"
+        );
+    }
+
+    fn png_with_dimensions(width: u32, height: u32) -> Vec<u8> {
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+
+        let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        png.extend(png_chunk(b"IHDR", &ihdr));
+        png
+    }
+
+    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut signed = Vec::with_capacity(4 + data.len());
+        signed.extend_from_slice(kind);
+        signed.extend_from_slice(data);
+
+        let mut chunk = Vec::with_capacity(12 + data.len());
+        chunk.extend_from_slice(&(u32::try_from(data.len()).unwrap()).to_be_bytes());
+        chunk.extend_from_slice(&signed);
+        chunk.extend_from_slice(&png_crc(&signed).to_be_bytes());
+        chunk
+    }
+
+    #[test]
+    fn batch_limit_stays_between_one_and_four() {
+        assert_eq!(super::batch_limit_for(0), 1);
+        assert_eq!(super::batch_limit_for(1), 1);
+        assert_eq!(super::batch_limit_for(2), 2);
+        assert_eq!(super::batch_limit_for(3), 3);
+        assert_eq!(super::batch_limit_for(8), 4);
+    }
+
+    #[test]
+    fn reserved_names_skip_disk_and_earlier_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "image-converter-reserve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo_jpg = dir.join("photo.jpg");
+        let photo_png = dir.join("photo.png");
+        std::fs::write(&photo_jpg, b"a").unwrap();
+        std::fs::write(&photo_png, b"b").unwrap();
+        std::fs::write(dir.join("photo_converted.jpg"), b"taken").unwrap();
+
+        let mut reserved = std::collections::HashSet::new();
+        let first = super::reserve_output_path(
+            &photo_jpg,
+            &Some(dir.clone()),
+            super::TargetFormat::Jpg,
+            true,
+            "_converted",
+            &mut reserved,
+        )
+        .unwrap();
+        let second = super::reserve_output_path(
+            &photo_png,
+            &Some(dir.clone()),
+            super::TargetFormat::Jpg,
+            true,
+            "_converted",
+            &mut reserved,
+        )
+        .unwrap();
+
+        assert_eq!(first, dir.join("photo_converted(1).jpg"));
+        assert_eq!(second, dir.join("photo_converted(2).jpg"));
+        assert_ne!(first, second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn png_crc(data: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
     }
 }

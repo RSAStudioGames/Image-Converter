@@ -1,14 +1,22 @@
 [package]
 name = "rust_image_converter"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
-# GUI Framework
-iced = { version = "0.12", features = ["image", "tokio", "debug"] }
+# GUI Framework. `debug` is an iced overlay (F12) and is not profile-specific,
+# so leaving it enabled would turn it on for release builds too.
+# The `image` feature is the iced image widget, which this app does not use.
+iced = { version = "0.12", features = ["tokio"] }
 
-# Image Processing
-image = "0.25.10"
+# Image Processing.
+# `rayon` is a default feature (AVIF/EXR pools and parallel iterators). Leave it
+# off so a batch does not start a second pool beside its workers. JPEG bytes go
+# through turbojpeg; these features cover the other formats and the JPEG fallback.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
+# Do not enable `rayon`. Resize stays on the file's own worker. A parallel
+# resize would fight the batch pool for the same cores.
 fast_image_resize = "6"
 turbojpeg = "1"
 
@@ -19,4 +27,10 @@ webp = "0.3"
 rfd = "0.14"
 walkdir = "2.4"
 trash = "3.2"
-tokio = { version = "1", features = ["full"] }
+# `rt` for spawn_blocking. `sync` for the batch semaphore. iced's tokio
+# feature still enables rt-multi-thread for the GUI executor.
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
