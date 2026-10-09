@@ -1,6 +1,6 @@
 # Image Converter
 
-Simple desktop app for converting images between JPG, PNG, GIF, BMP, and WebP.
+Simple Windows/Linux desktop app for converting images between JPG, PNG, GIF, BMP, and WebP.
 Supports animation for WebP and GIF conversion.
 
 ## Build
