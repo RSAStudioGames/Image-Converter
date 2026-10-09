@@ -1119,27 +1119,6 @@ fn encode_jpeg<W: std::io::Write>(
     Ok(())
 }
 
-const MAX_IMAGE_DIM: u32 = 32_768;
-const MAX_DECODED_BYTES: u64 = 512 * 1024 * 1024;
-
-fn reject_oversized_dimensions(width: u32, height: u32) -> Result<(), Box<dyn std::error::Error>> {
-    if width > MAX_IMAGE_DIM || height > MAX_IMAGE_DIM {
-        return Err(format!(
-            "image is {width}x{height}, over the {MAX_IMAGE_DIM} pixel limit"
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn reject_oversized_buffer(bytes: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-    if bytes > MAX_DECODED_BYTES {
-        return Err("decoded image exceeds the 512 MiB allocation limit".into());
-    }
-    Ok(())
-}
-
 fn is_jpeg_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -1189,20 +1168,15 @@ fn load_scaled_image(
         }
     }
     if (scale - 1.0).abs() <= f64::EPSILON {
-        return Ok(open_with_limits(path)?);
+        return Ok(open_image(path)?);
     }
-    let img = open_with_limits(path)?;
+    let img = open_image(path)?;
     resize_to_scale(img, scale)
 }
 
-/// Strict width and height, plus the crate's default 512 MiB allocation cap.
-/// `Limits` is non-exhaustive, so this starts from `Default` and only sets dimensions.
-fn open_with_limits(path: &Path) -> image::ImageResult<image::DynamicImage> {
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_DIM);
-    limits.max_image_height = Some(MAX_IMAGE_DIM);
+fn open_image(path: &Path) -> image::ImageResult<image::DynamicImage> {
     let mut reader = image::ImageReader::open(path)?;
-    reader.limits(limits);
+    reader.no_limits();
     reader.decode()
 }
 
@@ -1218,9 +1192,6 @@ fn decode_jpeg(path: &Path) -> Result<image::DynamicImage, Box<dyn std::error::E
     let jpeg_data = std::fs::read(path)?;
     let mut decompressor = turbojpeg::Decompressor::new()?;
     let header = decompressor.read_header(&jpeg_data)?;
-    let full_width = u32::try_from(header.width)?;
-    let full_height = u32::try_from(header.height)?;
-    reject_oversized_dimensions(full_width, full_height)?;
     let format = jpeg_pixel_format(header.colorspace)?;
     decompress_jpeg(&mut decompressor, &jpeg_data, header.width, header.height, format)
 }
@@ -1238,7 +1209,6 @@ fn decode_jpeg_scaled(
     let factor = jpeg_dct_factor(scale).ok_or("JPEG scale is larger than 1/2")?;
     let full_width = u32::try_from(header.width)?;
     let full_height = u32::try_from(header.height)?;
-    reject_oversized_dimensions(full_width, full_height)?;
     let (target_width, target_height) = target_size(full_width, full_height, scale);
 
     decompressor.set_scaling_factor(factor)?;
@@ -1296,7 +1266,6 @@ fn decompress_jpeg(
     };
     let pitch = width.checked_mul(channels).ok_or("JPEG pitch overflow")?;
     let buf_len = pitch.checked_mul(height).ok_or("JPEG buffer overflow")?;
-    reject_oversized_buffer(buf_len)?;
     let mut pixels = vec![0u8; buf_len];
     let output = turbojpeg::Image {
         pixels: pixels.as_mut_slice(),
@@ -1623,42 +1592,43 @@ mod tests {
     }
 
     #[test]
-    fn oversized_png_header_is_rejected() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "image-converter-oversized-{}.png",
+    fn wide_png_above_former_dimension_cap_decodes() {
+        let path = std::env::temp_dir().join(format!(
+            "image-converter-wide-{}.png",
             std::process::id()
         ));
-        std::fs::write(&path, png_with_dimensions(super::MAX_IMAGE_DIM + 1, 1)).unwrap();
-        let error = super::open_with_limits(&path).unwrap_err();
+        image::RgbImage::from_pixel(32_769, 1, image::Rgb([1, 2, 3]))
+            .save(&path)
+            .unwrap();
+        let decoded = super::open_image(&path).unwrap();
         let _ = std::fs::remove_file(&path);
-        assert!(
-            matches!(error, image::ImageError::Limits(_)),
-            "expected a decode limit error, got {error}"
-        );
+        assert_eq!((decoded.width(), decoded.height()), (32_769, 1));
     }
 
-    fn png_with_dimensions(width: u32, height: u32) -> Vec<u8> {
-        let mut ihdr = Vec::with_capacity(13);
-        ihdr.extend_from_slice(&width.to_be_bytes());
-        ihdr.extend_from_slice(&height.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-
-        let mut png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        png.extend(png_chunk(b"IHDR", &ihdr));
-        png
-    }
-
-    fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
-        let mut signed = Vec::with_capacity(4 + data.len());
-        signed.extend_from_slice(kind);
-        signed.extend_from_slice(data);
-
-        let mut chunk = Vec::with_capacity(12 + data.len());
-        chunk.extend_from_slice(&(u32::try_from(data.len()).unwrap()).to_be_bytes());
-        chunk.extend_from_slice(&signed);
-        chunk.extend_from_slice(&png_crc(&signed).to_be_bytes());
-        chunk
+    #[test]
+    fn wide_jpeg_above_former_dimension_cap_decodes() {
+        let width = 32_769usize;
+        let pixels = vec![128u8; width];
+        let encoded = turbojpeg::compress(
+            turbojpeg::Image {
+                pixels: pixels.as_slice(),
+                width,
+                pitch: width,
+                height: 1,
+                format: turbojpeg::PixelFormat::GRAY,
+            },
+            90,
+            turbojpeg::Subsamp::Gray,
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "image-converter-wide-{}.jpg",
+            std::process::id()
+        ));
+        std::fs::write(&path, &encoded).unwrap();
+        let decoded = super::decode_jpeg(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((decoded.width(), decoded.height()), (32_769, 1));
     }
 
     #[test]
@@ -1711,17 +1681,5 @@ mod tests {
         assert_eq!(second, dir.join("photo_converted(2).jpg"));
         assert_ne!(first, second);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn png_crc(data: &[u8]) -> u32 {
-        let mut crc = 0xffff_ffffu32;
-        for &byte in data {
-            crc ^= u32::from(byte);
-            for _ in 0..8 {
-                let mask = (crc & 1).wrapping_neg();
-                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-            }
-        }
-        !crc
     }
 }
