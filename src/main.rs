@@ -720,18 +720,13 @@ fn convert_single_file(
         counter += 1;
     }
 
-    // 2. Load Image
-    let mut img = image::open(path)?;
+    // 2. Load and resize.
+    // Shrinks use Catmull-Rom. Enlarges use Lanczos3 through fast_image_resize.
+    // A JPEG at 1/2 or smaller is scaled in libjpeg-turbo during decode.
+    let scale = resize_option.get_scale_factor();
+    let img = load_scaled_image(path, scale)?;
 
     // 3. Processing
-    // Resizing
-    let scale = resize_option.get_scale_factor();
-    if (scale - 1.0).abs() > f64::EPSILON {
-        let n_width = (img.width() as f64 * scale) as u32;
-        let n_height = (img.height() as f64 * scale) as u32;
-        // Lanczos3 is generally high quality
-        img = img.resize(n_width, n_height, image::imageops::FilterType::Lanczos3);
-    }
 
     // Transparency Handling
     // Check if we need to remove alpha
@@ -814,8 +809,434 @@ fn convert_single_file(
     Ok(())
 }
 
+fn is_jpeg_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            let ext = ext.to_ascii_lowercase();
+            ext == "jpg" || ext == "jpeg"
+        })
+        .unwrap_or(false)
+}
+
+fn target_size(width: u32, height: u32, scale: f64) -> (u32, u32) {
+    let n_width = (width as f64 * scale) as u32;
+    let n_height = (height as f64 * scale) as u32;
+    (n_width.max(1), n_height.max(1))
+}
+
+/// Smallest libjpeg-turbo IDCT scale (1/8, 1/4, 1/2) that is still at least `scale`.
+/// Scales above 1/2 return `None` so the caller decodes the full image.
+fn jpeg_dct_factor(scale: f64) -> Option<turbojpeg::ScalingFactor> {
+    if !(scale <= 0.5) {
+        return None;
+    }
+    [
+        turbojpeg::ScalingFactor::ONE_EIGHTH,
+        turbojpeg::ScalingFactor::ONE_QUARTER,
+        turbojpeg::ScalingFactor::ONE_HALF,
+    ]
+    .into_iter()
+    .find(|factor| factor.num() as f64 / factor.denom() as f64 >= scale)
+}
+
+fn load_scaled_image(
+    path: &Path,
+    scale: f64,
+) -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
+    if (scale - 1.0).abs() <= f64::EPSILON {
+        return Ok(image::open(path)?);
+    }
+    if scale <= 0.5 && is_jpeg_path(path) {
+        if let Ok(img) = decode_jpeg_scaled(path, scale) {
+            return Ok(img);
+        }
+    }
+    let img = image::open(path)?;
+    resize_to_scale(img, scale)
+}
+
+fn resize_to_scale(
+    img: image::DynamicImage,
+    scale: f64,
+) -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
+    let (n_width, n_height) = target_size(img.width(), img.height(), scale);
+    resize_dynamic(img, n_width, n_height, scale)
+}
+
+fn decode_jpeg_scaled(
+    path: &Path,
+    scale: f64,
+) -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
+    let jpeg_data = std::fs::read(path)?;
+    let mut decompressor = turbojpeg::Decompressor::new()?;
+    let header = decompressor.read_header(&jpeg_data)?;
+    if header.is_lossless {
+        return Err("lossless JPEG has no IDCT scale".into());
+    }
+    let factor = jpeg_dct_factor(scale).ok_or("JPEG scale is larger than 1/2")?;
+    let full_width = u32::try_from(header.width)?;
+    let full_height = u32::try_from(header.height)?;
+    let (target_width, target_height) = target_size(full_width, full_height, scale);
+
+    decompressor.set_scaling_factor(factor)?;
+    let scaled = header.scaled(factor);
+    if scaled.width == 0 || scaled.height == 0 {
+        return Err("JPEG IDCT scale produced an empty image".into());
+    }
+
+    // CMYK and YCCK can only be decoded as CMYK. Fall back to image::open for those.
+    if matches!(
+        header.colorspace,
+        turbojpeg::Colorspace::CMYK | turbojpeg::Colorspace::YCCK
+    ) {
+        return Err("CMYK JPEG is decoded without an IDCT scale".into());
+    }
+    let format = if header.colorspace == turbojpeg::Colorspace::Gray {
+        turbojpeg::PixelFormat::GRAY
+    } else {
+        turbojpeg::PixelFormat::RGB
+    };
+    let channels = if format == turbojpeg::PixelFormat::GRAY {
+        1
+    } else {
+        3
+    };
+    let pitch = scaled
+        .width
+        .checked_mul(channels)
+        .ok_or("JPEG pitch overflow")?;
+    let buf_len = pitch
+        .checked_mul(scaled.height)
+        .ok_or("JPEG buffer overflow")?;
+    let mut pixels = vec![0u8; buf_len];
+    let output = turbojpeg::Image {
+        pixels: pixels.as_mut_slice(),
+        width: scaled.width,
+        pitch,
+        height: scaled.height,
+        format,
+    };
+    decompressor.decompress(&jpeg_data, output)?;
+
+    let decoded_width = u32::try_from(scaled.width)?;
+    let decoded_height = u32::try_from(scaled.height)?;
+    let decoded = if channels == 1 {
+        let buffer = image::GrayImage::from_raw(decoded_width, decoded_height, pixels)
+            .ok_or("gray JPEG buffer size mismatch")?;
+        image::DynamicImage::ImageLuma8(buffer)
+    } else {
+        let buffer = image::RgbImage::from_raw(decoded_width, decoded_height, pixels)
+            .ok_or("RGB JPEG buffer size mismatch")?;
+        image::DynamicImage::ImageRgb8(buffer)
+    };
+
+    if decoded_width == target_width && decoded_height == target_height {
+        Ok(decoded)
+    } else {
+        resize_dynamic(decoded, target_width, target_height, scale)
+    }
+}
+
+fn resize_dynamic(
+    img: image::DynamicImage,
+    dst_width: u32,
+    dst_height: u32,
+    scale: f64,
+) -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
+    if img.width() == dst_width && img.height() == dst_height {
+        return Ok(img);
+    }
+    let filter = if scale < 1.0 {
+        fast_image_resize::FilterType::CatmullRom
+    } else {
+        fast_image_resize::FilterType::Lanczos3
+    };
+    Ok(match img {
+        image::DynamicImage::ImageLuma8(buf) => image::DynamicImage::ImageLuma8(resize_u8_image(
+            buf,
+            dst_width,
+            dst_height,
+            fast_image_resize::PixelType::U8,
+            filter,
+        )?),
+        image::DynamicImage::ImageLumaA8(buf) => {
+            image::DynamicImage::ImageLumaA8(resize_u8_image(
+                buf,
+                dst_width,
+                dst_height,
+                fast_image_resize::PixelType::U8x2,
+                filter,
+            )?)
+        }
+        image::DynamicImage::ImageRgb8(buf) => image::DynamicImage::ImageRgb8(resize_u8_image(
+            buf,
+            dst_width,
+            dst_height,
+            fast_image_resize::PixelType::U8x3,
+            filter,
+        )?),
+        image::DynamicImage::ImageRgba8(buf) => image::DynamicImage::ImageRgba8(resize_u8_image(
+            buf,
+            dst_width,
+            dst_height,
+            fast_image_resize::PixelType::U8x4,
+            filter,
+        )?),
+        image::DynamicImage::ImageLuma16(buf) => {
+            image::DynamicImage::ImageLuma16(resize_u16_image(
+                buf,
+                dst_width,
+                dst_height,
+                fast_image_resize::PixelType::U16,
+                filter,
+            )?)
+        }
+        image::DynamicImage::ImageLumaA16(buf) => {
+            image::DynamicImage::ImageLumaA16(resize_u16_image(
+                buf,
+                dst_width,
+                dst_height,
+                fast_image_resize::PixelType::U16x2,
+                filter,
+            )?)
+        }
+        image::DynamicImage::ImageRgb16(buf) => image::DynamicImage::ImageRgb16(resize_u16_image(
+            buf,
+            dst_width,
+            dst_height,
+            fast_image_resize::PixelType::U16x3,
+            filter,
+        )?),
+        image::DynamicImage::ImageRgba16(buf) => {
+            image::DynamicImage::ImageRgba16(resize_u16_image(
+                buf,
+                dst_width,
+                dst_height,
+                fast_image_resize::PixelType::U16x4,
+                filter,
+            )?)
+        }
+        image::DynamicImage::ImageRgb32F(buf) => {
+            image::DynamicImage::ImageRgb32F(resize_f32_image(
+                buf,
+                dst_width,
+                dst_height,
+                fast_image_resize::PixelType::F32x3,
+                filter,
+            )?)
+        }
+        image::DynamicImage::ImageRgba32F(buf) => {
+            image::DynamicImage::ImageRgba32F(resize_f32_image(
+                buf,
+                dst_width,
+                dst_height,
+                fast_image_resize::PixelType::F32x4,
+                filter,
+            )?)
+        }
+        other => {
+            let rgba = other.to_rgba8();
+            image::DynamicImage::ImageRgba8(resize_u8_image(
+                rgba,
+                dst_width,
+                dst_height,
+                fast_image_resize::PixelType::U8x4,
+                filter,
+            )?)
+        }
+    })
+}
+
+fn resize_u8_image<P>(
+    buf: image::ImageBuffer<P, Vec<u8>>,
+    dst_width: u32,
+    dst_height: u32,
+    pixel_type: fast_image_resize::PixelType,
+    filter: fast_image_resize::FilterType,
+) -> Result<image::ImageBuffer<P, Vec<u8>>, Box<dyn std::error::Error>>
+where
+    P: image::Pixel<Subpixel = u8>,
+{
+    let (src_width, src_height) = (buf.width(), buf.height());
+    let raw = resize_bytes(
+        buf.into_raw(),
+        src_width,
+        src_height,
+        dst_width,
+        dst_height,
+        pixel_type,
+        filter,
+    )?;
+    image::ImageBuffer::from_raw(dst_width, dst_height, raw)
+        .ok_or_else(|| "resized buffer size mismatch".into())
+}
+
+fn resize_u16_image<P>(
+    buf: image::ImageBuffer<P, Vec<u16>>,
+    dst_width: u32,
+    dst_height: u32,
+    pixel_type: fast_image_resize::PixelType,
+    filter: fast_image_resize::FilterType,
+) -> Result<image::ImageBuffer<P, Vec<u16>>, Box<dyn std::error::Error>>
+where
+    P: image::Pixel<Subpixel = u16>,
+{
+    let (src_width, src_height) = (buf.width(), buf.height());
+    let raw = resize_bytes(
+        u16s_to_bytes(buf.into_raw()),
+        src_width,
+        src_height,
+        dst_width,
+        dst_height,
+        pixel_type,
+        filter,
+    )?;
+    let pixels = bytes_to_u16s(raw)?;
+    image::ImageBuffer::from_raw(dst_width, dst_height, pixels)
+        .ok_or_else(|| "resized buffer size mismatch".into())
+}
+
+fn resize_f32_image<P>(
+    buf: image::ImageBuffer<P, Vec<f32>>,
+    dst_width: u32,
+    dst_height: u32,
+    pixel_type: fast_image_resize::PixelType,
+    filter: fast_image_resize::FilterType,
+) -> Result<image::ImageBuffer<P, Vec<f32>>, Box<dyn std::error::Error>>
+where
+    P: image::Pixel<Subpixel = f32>,
+{
+    let (src_width, src_height) = (buf.width(), buf.height());
+    let raw = resize_bytes(
+        f32s_to_bytes(buf.into_raw()),
+        src_width,
+        src_height,
+        dst_width,
+        dst_height,
+        pixel_type,
+        filter,
+    )?;
+    let pixels = bytes_to_f32s(raw)?;
+    image::ImageBuffer::from_raw(dst_width, dst_height, pixels)
+        .ok_or_else(|| "resized buffer size mismatch".into())
+}
+
+fn resize_bytes(
+    src: Vec<u8>,
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+    pixel_type: fast_image_resize::PixelType,
+    filter: fast_image_resize::FilterType,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let src_image = fast_image_resize::images::Image::from_vec_u8(
+        src_width,
+        src_height,
+        src,
+        pixel_type,
+    )?;
+    let mut dst_image =
+        fast_image_resize::images::Image::new(dst_width, dst_height, pixel_type);
+    let mut resizer = fast_image_resize::Resizer::new();
+    let options = fast_image_resize::ResizeOptions::new()
+        .resize_alg(fast_image_resize::ResizeAlg::Convolution(filter));
+    resizer.resize(&src_image, &mut dst_image, &options)?;
+    Ok(dst_image.into_vec())
+}
+
+fn u16s_to_bytes(values: Vec<u16>) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 2);
+    for value in values {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
+fn bytes_to_u16s(bytes: Vec<u8>) -> Result<Vec<u16>, &'static str> {
+    if bytes.len() % 2 != 0 {
+        return Err("resized buffer size mismatch");
+    }
+    Ok(bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+        .collect())
+}
+
+fn f32s_to_bytes(values: Vec<f32>) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    bytes
+}
+
+fn bytes_to_f32s(bytes: Vec<u8>) -> Result<Vec<f32>, &'static str> {
+    if bytes.len() % 4 != 0 {
+        return Err("resized buffer size mismatch");
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
 // --- Main Entry ---
 
 fn main() -> iced::Result {
     ImageConverter::run(Settings::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{jpeg_dct_factor, resize_to_scale};
+
+    #[test]
+    fn jpeg_dct_factor_picks_smallest_sufficient_idct() {
+        assert_eq!(
+            jpeg_dct_factor(0.5),
+            Some(turbojpeg::ScalingFactor::ONE_HALF)
+        );
+        assert_eq!(
+            jpeg_dct_factor(0.3),
+            Some(turbojpeg::ScalingFactor::ONE_HALF)
+        );
+        assert_eq!(
+            jpeg_dct_factor(0.25),
+            Some(turbojpeg::ScalingFactor::ONE_QUARTER)
+        );
+        assert_eq!(
+            jpeg_dct_factor(0.2),
+            Some(turbojpeg::ScalingFactor::ONE_QUARTER)
+        );
+        assert_eq!(
+            jpeg_dct_factor(0.1),
+            Some(turbojpeg::ScalingFactor::ONE_EIGHTH)
+        );
+        assert_eq!(jpeg_dct_factor(0.51), None);
+        assert_eq!(jpeg_dct_factor(1.0), None);
+        assert_eq!(jpeg_dct_factor(2.0), None);
+    }
+
+    #[test]
+    fn shrink_rgb_stays_rgb_at_truncated_size() {
+        let even = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            100,
+            80,
+            image::Rgb([10, 20, 30]),
+        ));
+        let even_out = resize_to_scale(even, 0.5).unwrap();
+        assert_eq!((even_out.width(), even_out.height()), (50, 40));
+        assert!(matches!(even_out, image::DynamicImage::ImageRgb8(_)));
+
+        let odd = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            101,
+            81,
+            image::Rgb([10, 20, 30]),
+        ));
+        let odd_out = resize_to_scale(odd, 0.5).unwrap();
+        assert_eq!((odd_out.width(), odd_out.height()), (50, 40));
+        assert!(matches!(odd_out, image::DynamicImage::ImageRgb8(_)));
+    }
 }
