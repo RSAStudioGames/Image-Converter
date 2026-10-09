@@ -2,14 +2,19 @@
 
 use iced::widget::{
     button, checkbox, column, container, horizontal_rule, pick_list, row, scrollable, slider, text,
-    text_input,
+    text_input, Space,
 };
 use iced::{
     executor, Application, Command, Element, Length, Settings, Subscription, Theme,
 };
 use iced::widget::container::StyleSheet;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+const ROW_HEIGHT: f32 = 32.0;
+const LIST_OVERSCAN: usize = 8;
+const INITIAL_VIEWPORT_HEIGHT: f32 = 2000.0;
 
 // --- Data Structures ---
 
@@ -133,8 +138,13 @@ impl ResizeOption {
 struct ImageConverter {
     // File Management
     file_queue: Vec<PathBuf>,
-    selected_indices: Vec<usize>, // Track selected file indices
+    queued_paths: HashSet<PathBuf>,
+    selected_indices: HashSet<usize>,
     recursive_mode: bool,
+    scan_generation: u64,
+    file_list_id: scrollable::Id,
+    list_scroll_y: f32,
+    list_viewport_height: f32,
 
     // Settings
     target_format: TargetFormat,
@@ -160,9 +170,13 @@ enum Message {
     // File Actions
     AddFiles,
     AddFolder,
+    FilesPicked(Option<Vec<PathBuf>>),
+    FolderPicked(Option<PathBuf>),
+    FolderScanned { generation: u64, paths: Vec<PathBuf> },
     ClearFiles,
     ToggleRecursive(bool),
     FileDropped(PathBuf),
+    FileListScrolled(scrollable::Viewport),
 
     // File Selection and Management
     SelectFile(usize),         // Index of file to select
@@ -177,6 +191,7 @@ enum Message {
     // Settings Updates
     SetTargetFormat(TargetFormat),
     SetOutputDirectory,
+    OutputDirectoryPicked(Option<PathBuf>),
     UpdateQuality(f64),
     SetResizeOption(ResizeOption),
     ToggleAppendSuffix(bool),
@@ -201,8 +216,13 @@ impl Application for ImageConverter {
         (
             ImageConverter {
                 file_queue: Vec::new(),
-                selected_indices: Vec::new(), // Initialize empty selection
+                queued_paths: HashSet::new(),
+                selected_indices: HashSet::new(),
                 recursive_mode: false,
+                scan_generation: 0,
+                file_list_id: scrollable::Id::unique(),
+                list_scroll_y: 0.0,
+                list_viewport_height: INITIAL_VIEWPORT_HEIGHT,
                 target_format: TargetFormat::Jpg,
                 output_dir: None,
                 quality: 95.0,
@@ -228,30 +248,65 @@ impl Application for ImageConverter {
         match message {
             Message::AddFiles => {
                 if self.is_converting { return Command::none(); }
-                let files = rfd::FileDialog::new()
-                    .add_filter("Images", &["jpg", "jpeg", "png", "bmp", "gif", "webp"])
-                    .pick_files();
-                
+                Command::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("Images", &["jpg", "jpeg", "png", "bmp", "gif", "webp"])
+                            .pick_files()
+                            .await
+                            .map(|files| files.into_iter().map(PathBuf::from).collect())
+                    },
+                    Message::FilesPicked,
+                )
+            }
+            Message::AddFolder => {
+                if self.is_converting { return Command::none(); }
+                Command::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .pick_folder()
+                            .await
+                            .map(PathBuf::from)
+                    },
+                    Message::FolderPicked,
+                )
+            }
+            Message::FilesPicked(files) => {
+                if self.is_converting { return Command::none(); }
                 if let Some(files) = files {
                     for file in files {
-                        if !self.file_queue.contains(&file) {
-                            self.file_queue.push(file);
-                        }
+                        self.push_file(file);
                     }
                 }
                 Command::none()
             }
-            Message::AddFolder => {
+            Message::FolderPicked(path) => {
                 if self.is_converting { return Command::none(); }
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    self.scan_folder(path);
+                match path {
+                    Some(path) => self.start_folder_scan(path),
+                    None => Command::none(),
+                }
+            }
+            Message::FolderScanned { generation, paths } => {
+                if generation != self.scan_generation {
+                    return Command::none();
+                }
+                for path in paths {
+                    self.push_file(path);
+                }
+                if self.status_message == "Scanning folder..." {
+                    self.status_message = "Ready".to_string();
                 }
                 Command::none()
             }
             Message::ClearFiles => {
                 if !self.is_converting {
                     self.file_queue.clear();
+                    self.queued_paths.clear();
+                    self.selected_indices.clear();
+                    self.scan_generation = self.scan_generation.wrapping_add(1);
                     self.status_message = "Ready".to_string();
+                    return self.clamp_list_scroll();
                 }
                 Command::none()
             }
@@ -262,41 +317,45 @@ impl Application for ImageConverter {
             Message::FileDropped(path) => {
                 if self.is_converting { return Command::none(); }
                 if path.is_dir() {
-                    self.scan_folder(path);
-                } else if is_image(&path) && !self.file_queue.contains(&path) {
-                    self.file_queue.push(path);
+                    return self.start_folder_scan(path);
+                } else if is_image(&path) {
+                    self.push_file(path);
+                }
+                Command::none()
+            }
+            Message::FileListScrolled(viewport) => {
+                let offset = viewport.absolute_offset();
+                self.list_scroll_y = offset.y.max(0.0);
+                let height = viewport.bounds().height;
+                if height > 1.0 {
+                    self.list_viewport_height = height;
                 }
                 Command::none()
             }
             Message::SelectFile(index) => {
-                if index < self.file_queue.len() && !self.selected_indices.contains(&index) {
-                    self.selected_indices.push(index);
+                if index < self.file_queue.len() {
+                    self.selected_indices.insert(index);
                 }
                 Command::none()
             }
             Message::DeselectFile(index) => {
-                self.selected_indices.retain(|&i| i != index);
+                self.selected_indices.remove(&index);
                 Command::none()
             }
             Message::ToggleFileSelection(index) => {
                 if index < self.file_queue.len() {
                     if self.selected_indices.contains(&index) {
-                        // If the file is already selected, deselect it
-                        self.selected_indices.retain(|&i| i != index);
+                        self.selected_indices.remove(&index);
                     } else {
-                        // If it's not selected, add it to the selection
-                        // For now, implement single selection behavior (clicking deselects others)
+                        // Clicking selects only this file.
                         self.selected_indices.clear();
-                        self.selected_indices.push(index);
+                        self.selected_indices.insert(index);
                     }
                 }
                 Command::none()
             }
             Message::SelectAllFiles => {
-                self.selected_indices.clear();
-                for i in 0..self.file_queue.len() {
-                    self.selected_indices.push(i);
-                }
+                self.selected_indices = (0..self.file_queue.len()).collect();
                 Command::none()
             }
             Message::DeselectAllFiles => {
@@ -305,56 +364,69 @@ impl Application for ImageConverter {
             }
             Message::DeleteSelected => {
                 if !self.is_converting && !self.selected_indices.is_empty() {
-                    // Create a copy of the selected indices and sort them in descending order
-                    // to prevent index shifting during removal
-                    let mut indices_to_remove = self.selected_indices.clone();
-                    indices_to_remove.sort_by(|a, b| b.cmp(a));  // Descending order
+                    // Remove from the end so earlier indices stay valid.
+                    let mut indices_to_remove: Vec<usize> = self.selected_indices.iter().copied().collect();
+                    indices_to_remove.sort_by(|a, b| b.cmp(a));
 
-                    // Remove selected files from the queue
-                    for &index in &indices_to_remove {
+                    for index in indices_to_remove {
                         if index < self.file_queue.len() {
-                            self.file_queue.remove(index);
+                            let path = self.file_queue.remove(index);
+                            self.queued_paths.remove(&path);
                         }
                     }
 
-                    // Clear selection after removal
                     self.selected_indices.clear();
+                    return self.clamp_list_scroll();
                 }
                 Command::none()
             }
             Message::RightClickFile(index) => {
                 // On right-clicking a file, select it and trigger deletion (for simplicity)
                 self.selected_indices.clear();
-                self.selected_indices.push(index);
+                self.selected_indices.insert(index);
                 Command::perform(async {}, |_| Message::DeleteSelected)
             }
             Message::KeyboardInput { key, modifiers } => {
                 use iced::keyboard::key;
                 match key {
                     iced::keyboard::Key::Named(key::Named::ArrowUp) => {
-                        // Move selection up
-                        if !self.selected_indices.is_empty() {
-                            let min_index = self.selected_indices.iter().min().copied().unwrap_or(0);
+                        let next = if !self.selected_indices.is_empty() {
+                            let min_index = self.selected_indices.iter().copied().min().unwrap_or(0);
                             if min_index > 0 {
                                 self.selected_indices.clear();
-                                self.selected_indices.push(min_index - 1);
+                                self.selected_indices.insert(min_index - 1);
+                                Some(min_index - 1)
+                            } else {
+                                None
                             }
                         } else if !self.file_queue.is_empty() {
-                            // If nothing selected, select the first item
-                            self.selected_indices.push(0);
+                            self.selected_indices.insert(0);
+                            Some(0)
+                        } else {
+                            None
+                        };
+                        if let Some(index) = next {
+                            return self.reveal_index(index);
                         }
                     }
                     iced::keyboard::Key::Named(key::Named::ArrowDown) => {
-                        // Move selection down
-                        if !self.selected_indices.is_empty() {
-                            let max_index = self.selected_indices.iter().max().copied().unwrap_or(0);
+                        let next = if !self.selected_indices.is_empty() {
+                            let max_index = self.selected_indices.iter().copied().max().unwrap_or(0);
                             if max_index < self.file_queue.len().saturating_sub(1) {
                                 self.selected_indices.clear();
-                                self.selected_indices.push(max_index + 1);
+                                self.selected_indices.insert(max_index + 1);
+                                Some(max_index + 1)
+                            } else {
+                                None
                             }
                         } else if !self.file_queue.is_empty() {
-                            // If nothing selected, select the first item
-                            self.selected_indices.push(0);
+                            self.selected_indices.insert(0);
+                            Some(0)
+                        } else {
+                            None
+                        };
+                        if let Some(index) = next {
+                            return self.reveal_index(index);
                         }
                     }
                     iced::keyboard::Key::Named(key::Named::Delete) => {
@@ -374,7 +446,18 @@ impl Application for ImageConverter {
                 Command::none()
             }
             Message::SetOutputDirectory => {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                Command::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .pick_folder()
+                            .await
+                            .map(PathBuf::from)
+                    },
+                    Message::OutputDirectoryPicked,
+                )
+            }
+            Message::OutputDirectoryPicked(path) => {
+                if let Some(path) = path {
                     self.output_dir = Some(path);
                 }
                 Command::none()
@@ -481,29 +564,45 @@ impl Application for ImageConverter {
 
     fn view(&self) -> Element<Message> {
         // --- 3.2 File Management (Left) ---
-        let mut file_column = column!().spacing(1);
-        for (index, path) in self.file_queue.iter().enumerate() {
+        let (start, end) = self.visible_range();
+        let top_gap = start as f32 * ROW_HEIGHT;
+        let bottom_gap = (self.file_queue.len() - end) as f32 * ROW_HEIGHT;
+
+        let mut rows = column![].spacing(0);
+        for index in start..end {
+            let path = &self.file_queue[index];
             let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
-            // Create a container for the file entry with selection highlighting
-            let file_entry = container(text(file_name))
+            let file_entry = container(text(file_name).size(14))
                 .width(Length::Fill)
-                .padding(5)
+                .height(Length::Fill)
+                .padding([4, 5])
                 .style(if self.selected_indices.contains(&index) {
                     iced::theme::Container::Custom(Box::new(SelectedFileStyle))
                 } else {
                     iced::theme::Container::Box
                 });
 
-            // Wrap in a button for click handling
             let file_button = button(file_entry)
                 .on_press(Message::ToggleFileSelection(index))
-                .style(iced::theme::Button::Text); // Use Text style to make it appear transparent
+                .width(Length::Fill)
+                .height(Length::Fixed(ROW_HEIGHT))
+                .padding(0)
+                .style(iced::theme::Button::Text);
 
-            file_column = file_column.push(file_button);
+            rows = rows.push(file_button);
         }
 
+        let file_column = column![
+            Space::with_height(Length::Fixed(top_gap)),
+            rows,
+            Space::with_height(Length::Fixed(bottom_gap)),
+        ]
+        .spacing(0);
+
         let file_list = scrollable(file_column)
+            .id(self.file_list_id.clone())
+            .on_scroll(Message::FileListScrolled)
             .height(Length::Fill)
             .width(Length::Fill);
 
@@ -537,9 +636,18 @@ impl Application for ImageConverter {
             ].spacing(10).align_items(iced::Alignment::Center)
         ].spacing(5);
 
-        // Quality
+        // Quality. PNG is lossless, so the slider picks compression speed versus file size.
+        let quality_label = if self.target_format == TargetFormat::Png {
+            if self.quality >= 100.0 {
+                format!("Output Quality: {:.0} (smaller)", self.quality)
+            } else {
+                format!("Output Quality: {:.0} (fast)", self.quality)
+            }
+        } else {
+            format!("Output Quality: {:.0}", self.quality)
+        };
         let quality_section = column![
-            text(format!("Output Quality: {:.0}", self.quality)).size(14),
+            text(quality_label).size(14),
             slider(1.0..=100.0, self.quality, Message::UpdateQuality)
         ].spacing(5);
 
@@ -601,17 +709,105 @@ impl Application for ImageConverter {
 }
 
 impl ImageConverter {
-    fn scan_folder(&mut self, path: PathBuf) {
-        let max_depth = if self.recursive_mode { usize::MAX } else { 1 };
-        
-        for entry in WalkDir::new(path).max_depth(max_depth).into_iter().filter_map(|e| e.ok()) {
-            if entry.path().is_file() && is_image(entry.path()) {
-                if !self.file_queue.contains(&entry.path().to_path_buf()) {
-                    self.file_queue.push(entry.path().to_path_buf());
-                }
+    fn push_file(&mut self, path: PathBuf) {
+        if self.queued_paths.insert(path.clone()) {
+            self.file_queue.push(path);
+        }
+    }
+
+    fn start_folder_scan(&mut self, path: PathBuf) -> Command<Message> {
+        self.scan_generation = self.scan_generation.wrapping_add(1);
+        let generation = self.scan_generation;
+        let recursive = self.recursive_mode;
+        let known = self.queued_paths.clone();
+        self.status_message = "Scanning folder...".to_string();
+
+        Command::perform(
+            async move {
+                let paths = tokio::task::spawn_blocking(move || {
+                    scan_folder_paths(path, recursive, known)
+                })
+                .await
+                .unwrap_or_default();
+                (generation, paths)
+            },
+            |(generation, paths)| Message::FolderScanned { generation, paths },
+        )
+    }
+
+    fn visible_range(&self) -> (usize, usize) {
+        let len = self.file_queue.len();
+        if len == 0 {
+            return (0, 0);
+        }
+
+        let start = (self.clamped_scroll_y() / ROW_HEIGHT).floor() as usize;
+        let start = start.saturating_sub(LIST_OVERSCAN).min(len);
+        let viewport_rows = (self.list_viewport_height / ROW_HEIGHT).ceil() as usize + 1;
+        let end = (start + viewport_rows + LIST_OVERSCAN * 2).min(len);
+        (start, end)
+    }
+
+    fn reveal_index(&mut self, index: usize) -> Command<Message> {
+        let len = self.file_queue.len();
+        if len == 0 {
+            return Command::none();
+        }
+
+        let start = ((self.clamped_scroll_y() / ROW_HEIGHT).floor() as usize).min(len);
+        let rows = ((self.list_viewport_height / ROW_HEIGHT).ceil() as usize).max(1);
+        let end = (start + rows).min(len);
+        if index >= start && index < end {
+            return Command::none();
+        }
+
+        let y = if index < start {
+            index as f32 * ROW_HEIGHT
+        } else {
+            ((index as f32 + 1.0) * ROW_HEIGHT - self.list_viewport_height).max(0.0)
+        };
+        self.list_scroll_y = y;
+        scrollable::scroll_to(
+            self.file_list_id.clone(),
+            scrollable::AbsoluteOffset { x: 0.0, y },
+        )
+    }
+
+    fn max_scroll_y(&self) -> f32 {
+        (self.file_queue.len() as f32 * ROW_HEIGHT - self.list_viewport_height).max(0.0)
+    }
+
+    fn clamped_scroll_y(&self) -> f32 {
+        self.list_scroll_y.clamp(0.0, self.max_scroll_y())
+    }
+
+    fn clamp_list_scroll(&mut self) -> Command<Message> {
+        let y = self.clamped_scroll_y();
+        if (self.list_scroll_y - y).abs() < f32::EPSILON {
+            return Command::none();
+        }
+        self.list_scroll_y = y;
+        scrollable::scroll_to(
+            self.file_list_id.clone(),
+            scrollable::AbsoluteOffset { x: 0.0, y },
+        )
+    }
+}
+
+fn scan_folder_paths(path: PathBuf, recursive: bool, mut known: HashSet<PathBuf>) -> Vec<PathBuf> {
+    let max_depth = if recursive { usize::MAX } else { 1 };
+    let mut found = Vec::new();
+
+    for entry in WalkDir::new(path).max_depth(max_depth).into_iter().filter_map(|e| e.ok()) {
+        if entry.path().is_file() && is_image(entry.path()) {
+            let file_path = entry.into_path();
+            if known.insert(file_path.clone()) {
+                found.push(file_path);
             }
         }
     }
+
+    found
 }
 
 // --- Custom Styles ---
@@ -760,15 +956,19 @@ fn convert_single_file(
 
     match target_format {
         TargetFormat::Jpg => {
-            // Quality mapping: 1-100
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, quality as u8);
-            encoder.encode_image(&final_img)?;
+            encode_jpeg(&final_img, quality, &mut writer)?;
         },
         TargetFormat::Png => {
-             // Map 1-100 to compression types roughly? 
-             // Image crate PNG encoder takes CompressionType. 
-             // Default is usually fine. We'll stick to standard write.
-             let encoder = image::codecs::png::PngEncoder::new(&mut writer);
+             let compression = if quality >= 100.0 {
+                 image::codecs::png::CompressionType::Default
+             } else {
+                 image::codecs::png::CompressionType::Fast
+             };
+             let encoder = image::codecs::png::PngEncoder::new_with_quality(
+                 &mut writer,
+                 compression,
+                 image::codecs::png::FilterType::Adaptive,
+             );
              final_img.write_with_encoder(encoder)?;
         },
         TargetFormat::Gif => {
@@ -809,6 +1009,43 @@ fn convert_single_file(
     Ok(())
 }
 
+fn encode_jpeg<W: std::io::Write>(
+    img: &image::DynamicImage,
+    quality: f64,
+    writer: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let quality = quality.clamp(1.0, 100.0).round() as i32;
+    // Quality 100 stays lossy. Grayscale stays one channel; color uses 4:2:0.
+    let encoded = if let Some(gray) = img.as_luma8() {
+        turbojpeg::compress(
+            turbojpeg::Image {
+                pixels: gray.as_raw().as_slice(),
+                width: gray.width() as usize,
+                pitch: gray.width() as usize,
+                height: gray.height() as usize,
+                format: turbojpeg::PixelFormat::GRAY,
+            },
+            quality,
+            turbojpeg::Subsamp::Gray,
+        )?
+    } else {
+        let rgb = img.to_rgb8();
+        turbojpeg::compress(
+            turbojpeg::Image {
+                pixels: rgb.as_raw().as_slice(),
+                width: rgb.width() as usize,
+                pitch: rgb.width() as usize * 3,
+                height: rgb.height() as usize,
+                format: turbojpeg::PixelFormat::RGB,
+            },
+            quality,
+            turbojpeg::Subsamp::Sub2x2,
+        )?
+    };
+    writer.write_all(&encoded)?;
+    Ok(())
+}
+
 fn is_jpeg_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -844,13 +1081,21 @@ fn load_scaled_image(
     path: &Path,
     scale: f64,
 ) -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
+    if is_jpeg_path(path) {
+        if scale <= 0.5 {
+            if let Ok(img) = decode_jpeg_scaled(path, scale) {
+                return Ok(img);
+            }
+        }
+        if let Ok(img) = decode_jpeg(path) {
+            if (scale - 1.0).abs() <= f64::EPSILON {
+                return Ok(img);
+            }
+            return resize_to_scale(img, scale);
+        }
+    }
     if (scale - 1.0).abs() <= f64::EPSILON {
         return Ok(image::open(path)?);
-    }
-    if scale <= 0.5 && is_jpeg_path(path) {
-        if let Ok(img) = decode_jpeg_scaled(path, scale) {
-            return Ok(img);
-        }
     }
     let img = image::open(path)?;
     resize_to_scale(img, scale)
@@ -862,6 +1107,14 @@ fn resize_to_scale(
 ) -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
     let (n_width, n_height) = target_size(img.width(), img.height(), scale);
     resize_dynamic(img, n_width, n_height, scale)
+}
+
+fn decode_jpeg(path: &Path) -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
+    let jpeg_data = std::fs::read(path)?;
+    let mut decompressor = turbojpeg::Decompressor::new()?;
+    let header = decompressor.read_header(&jpeg_data)?;
+    let format = jpeg_pixel_format(header.colorspace)?;
+    decompress_jpeg(&mut decompressor, &jpeg_data, header.width, header.height, format)
 }
 
 fn decode_jpeg_scaled(
@@ -885,56 +1138,75 @@ fn decode_jpeg_scaled(
         return Err("JPEG IDCT scale produced an empty image".into());
     }
 
-    // CMYK and YCCK can only be decoded as CMYK. Fall back to image::open for those.
-    if matches!(
-        header.colorspace,
-        turbojpeg::Colorspace::CMYK | turbojpeg::Colorspace::YCCK
-    ) {
-        return Err("CMYK JPEG is decoded without an IDCT scale".into());
-    }
-    let format = if header.colorspace == turbojpeg::Colorspace::Gray {
-        turbojpeg::PixelFormat::GRAY
-    } else {
-        turbojpeg::PixelFormat::RGB
-    };
-    let channels = if format == turbojpeg::PixelFormat::GRAY {
-        1
-    } else {
-        3
-    };
-    let pitch = scaled
-        .width
-        .checked_mul(channels)
-        .ok_or("JPEG pitch overflow")?;
-    let buf_len = pitch
-        .checked_mul(scaled.height)
-        .ok_or("JPEG buffer overflow")?;
-    let mut pixels = vec![0u8; buf_len];
-    let output = turbojpeg::Image {
-        pixels: pixels.as_mut_slice(),
-        width: scaled.width,
-        pitch,
-        height: scaled.height,
+    let format = jpeg_pixel_format(header.colorspace)?;
+    let decoded = decompress_jpeg(
+        &mut decompressor,
+        &jpeg_data,
+        scaled.width,
+        scaled.height,
         format,
-    };
-    decompressor.decompress(&jpeg_data, output)?;
-
-    let decoded_width = u32::try_from(scaled.width)?;
-    let decoded_height = u32::try_from(scaled.height)?;
-    let decoded = if channels == 1 {
-        let buffer = image::GrayImage::from_raw(decoded_width, decoded_height, pixels)
-            .ok_or("gray JPEG buffer size mismatch")?;
-        image::DynamicImage::ImageLuma8(buffer)
-    } else {
-        let buffer = image::RgbImage::from_raw(decoded_width, decoded_height, pixels)
-            .ok_or("RGB JPEG buffer size mismatch")?;
-        image::DynamicImage::ImageRgb8(buffer)
-    };
+    )?;
+    let decoded_width = decoded.width();
+    let decoded_height = decoded.height();
 
     if decoded_width == target_width && decoded_height == target_height {
         Ok(decoded)
     } else {
         resize_dynamic(decoded, target_width, target_height, scale)
+    }
+}
+
+fn jpeg_pixel_format(
+    colorspace: turbojpeg::Colorspace,
+) -> Result<turbojpeg::PixelFormat, Box<dyn std::error::Error>> {
+    // CMYK and YCCK can only be decoded as CMYK. Fall back to image::open for those.
+    if matches!(
+        colorspace,
+        turbojpeg::Colorspace::CMYK | turbojpeg::Colorspace::YCCK
+    ) {
+        return Err("CMYK JPEG is decoded without libjpeg-turbo".into());
+    }
+    Ok(if colorspace == turbojpeg::Colorspace::Gray {
+        turbojpeg::PixelFormat::GRAY
+    } else {
+        turbojpeg::PixelFormat::RGB
+    })
+}
+
+fn decompress_jpeg(
+    decompressor: &mut turbojpeg::Decompressor,
+    jpeg_data: &[u8],
+    width: usize,
+    height: usize,
+    format: turbojpeg::PixelFormat,
+) -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
+    let channels = if format == turbojpeg::PixelFormat::GRAY {
+        1
+    } else {
+        3
+    };
+    let pitch = width.checked_mul(channels).ok_or("JPEG pitch overflow")?;
+    let buf_len = pitch.checked_mul(height).ok_or("JPEG buffer overflow")?;
+    let mut pixels = vec![0u8; buf_len];
+    let output = turbojpeg::Image {
+        pixels: pixels.as_mut_slice(),
+        width,
+        pitch,
+        height,
+        format,
+    };
+    decompressor.decompress(jpeg_data, output)?;
+
+    let decoded_width = u32::try_from(width)?;
+    let decoded_height = u32::try_from(height)?;
+    if channels == 1 {
+        let buffer = image::GrayImage::from_raw(decoded_width, decoded_height, pixels)
+            .ok_or("gray JPEG buffer size mismatch")?;
+        Ok(image::DynamicImage::ImageLuma8(buffer))
+    } else {
+        let buffer = image::RgbImage::from_raw(decoded_width, decoded_height, pixels)
+            .ok_or("RGB JPEG buffer size mismatch")?;
+        Ok(image::DynamicImage::ImageRgb8(buffer))
     }
 }
 
