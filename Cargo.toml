@@ -1,0 +1,20 @@
+[package]
+name = "rust_image_converter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GUI Framework
+iced = { version = "0.12", features = ["image", "tokio", "debug"] }
+
+# Image Processing
+image = "0.24"
+
+# WebP Processing
+webp = "0.3"
+
+# File System & Utilities
+rfd = "0.14"
+walkdir = "2.4"
+trash = "3.2"
+tokio = { version = "1", features = ["full"] }
