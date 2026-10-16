@@ -59,25 +59,21 @@ jobs:
       - name: Build release binary
         run: cargo +stable build --locked --release --target ${{ matrix.target }}
 
-      - name: Package Linux release
+      - name: Prepare Linux executable
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          mkdir -p package dist
-          cp target/${{ matrix.target }}/release/rust_image_converter package/
-          cp README.md package/
-          tar -czf dist/image-converter-${{ matrix.platform }}.tar.gz -C package .
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/rust_image_converter dist/image-converter-${{ matrix.platform }}
 
-      - name: Package Windows release
+      - name: Prepare Windows executable
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path package, dist -Force
-          Copy-Item target/${{ matrix.target }}/release/rust_image_converter.exe package/
-          Copy-Item README.md package/
-          Compress-Archive -Path package/* -DestinationPath dist/image-converter-${{ matrix.platform }}.zip
+          New-Item -ItemType Directory -Path dist -Force
+          Copy-Item target/${{ matrix.target }}/release/rust_image_converter.exe dist/image-converter-${{ matrix.platform }}.exe
 
-      - name: Upload release archive
+      - name: Upload executable for publishing
         uses: actions/upload-artifact@v4
         with:
           name: image-converter-${{ matrix.platform }}
@@ -98,7 +94,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Publish archives
+      - name: Publish executables
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
